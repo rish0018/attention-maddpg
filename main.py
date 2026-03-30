@@ -3,11 +3,19 @@
 import argparse
 import numpy as np
 import torch
+import sys
+import os
 
 from ddpg_agent import DdpgActor, DdpgCritic
 from replaybuffers import ReplayBuffer
 from utils import train_agent
-from unityagents import UnityEnvironment
+
+try:
+    from unityagents import UnityEnvironment
+    HAS_UNITY = True
+except ImportError:
+    HAS_UNITY = False
+    print("Warning: unityagents package not found. Install with: pip install unityagents")
 
 
 if __name__ == "__main__":
@@ -24,8 +32,18 @@ if __name__ == "__main__":
     train_mode = args.mode == "train"
 
     # -------- LOAD ENV --------
+    if not HAS_UNITY:
+        print("Error: UnityEnvironment is required. Please install unityagents package.")
+        sys.exit(1)
+
+    env_path = args.env_file
+    if not os.path.exists(env_path):
+        print(f"Error: Environment file not found at {env_path}")
+        print("Please provide a valid path to the Unity environment executable.")
+        sys.exit(1)
+
     env = UnityEnvironment(
-        file_name=args.env_file,
+        file_name=env_path,
         no_graphics=not train_mode
     )
 
