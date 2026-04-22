@@ -1,3 +1,15 @@
+"""
+model.py  —  Attention-MATD3 Networks
+==============================================
+Novelty stack:
+  1. Multi-Head Attention Critic  (vs single-head in vanilla MAAC/original)
+  2. Action-Conditioned K/V — actions feed directly into Key+Value projections
+     so the critic reasons about "who is doing WHAT" not just "who is where"
+  3. Twin Critic heads sharing one attention trunk  (MATD3 overestimation fix)
+  4. BatchNorm on actor input + critic fused representation
+"""
+
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,122 +18,164 @@ import numpy as np
 
 def hidden_init(layer):
     fan_in = layer.weight.data.size()[0]
-    lim = 1. / np.sqrt(fan_in)
+    lim = 1.0 / math.sqrt(fan_in)
     return (-lim, lim)
 
 
-# ===================== ACTOR ===================== #
+# ═══════════════════════════════════════════════════════════════
+#  ACTOR
+# ═══════════════════════════════════════════════════════════════
 class ActorQNetwork(nn.Module):
-    """
-    Actor network: maps a single agent's state → action.
-    Input:  state_size  (e.g. 33)
-    Output: action_size (e.g.  4)
-    """
+    """Deterministic actor: state -> action (single agent, decentralised)."""
 
-    def __init__(self, state_size, action_size, seed, h_1_size=256, h_2_size=128):
-        super(ActorQNetwork, self).__init__()
-        self.seed = torch.manual_seed(seed)
-
-        self.fc_1  = nn.Linear(state_size, h_1_size)
-        self.fc_2  = nn.Linear(h_1_size,   h_1_size)
-        self.fc_3  = nn.Linear(h_1_size,   h_2_size)
-        self.output = nn.Linear(h_2_size,  action_size)
-        self.reset_parameters()
+    def __init__(self, state_size, action_size, seed, h1=256, h2=128):
+        super().__init__()
+        torch.manual_seed(seed)
+        self.bn0 = nn.BatchNorm1d(state_size)
+        self.fc1 = nn.Linear(state_size, h1)
+        self.fc2 = nn.Linear(h1, h1)
+        self.fc3 = nn.Linear(h1, h2)
+        self.out = nn.Linear(h2, action_size)
+        self._reset()
 
     def forward(self, state):
-        y = F.relu(self.fc_1(state))
-        y = F.relu(self.fc_2(y))
-        y = F.relu(self.fc_3(y))
-        return torch.tanh(self.output(y))   # keep actions in [-1, 1]
+        if state.shape[0] > 1:
+            state = self.bn0(state)
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        return torch.tanh(self.out(x))
 
-    def reset_parameters(self):
-        self.fc_1.weight.data.uniform_(*hidden_init(self.fc_1))
-        self.fc_2.weight.data.uniform_(*hidden_init(self.fc_2))
-        self.fc_3.weight.data.uniform_(*hidden_init(self.fc_3))
-        self.output.weight.data.uniform_(-3e-3, 3e-3)
+    def _reset(self):
+        for fc in [self.fc1, self.fc2, self.fc3]:
+            fc.weight.data.uniform_(*hidden_init(fc))
+        self.out.weight.data.uniform_(-3e-3, 3e-3)
 
 
-# ===================== ATTENTION CRITIC ===================== #
-class CriticQNetwork(nn.Module):
+# ═══════════════════════════════════════════════════════════════
+#  NOVEL: Action-Conditioned Multi-Head Attention Block
+# ═══════════════════════════════════════════════════════════════
+class ActionConditionedMHA(nn.Module):
     """
-    Attention-based Centralized Critic
+    For each of N agents: Q from state_i, K and V from (state_i || action_i).
+    Runs scaled dot-product multi-head attention across all agents.
 
-    Input:
-        state  = (batch, 66) → [s1, s2]
-        action = (batch,  8) → [a1, a2]
+    Key novelties vs MAAC (Iqbal & Sha 2019):
+      - MAAC: state-only Q/K/V; actions enter AFTER attention
+      - Here: actions condition K and V so the critic learns
+        "this agent's info is relevant because of WHAT they did"
+      - n_heads > 1 captures multiple coordination modes in parallel
 
-    Process:
-        - Split states
-        - Apply attention
-        - Recombine
-        - Pass through MLP
+    Input:  states  (B, N, state_size)
+            actions (B, N, action_size)
+    Output: context (B, N, attn_dim)
+            weights (B, N, N)  — averaged over heads, for interpretability
+    """
+
+    def __init__(self, state_size, action_size, attn_dim=64, n_heads=4):
+        super().__init__()
+        assert attn_dim % n_heads == 0
+        self.n_heads  = n_heads
+        self.head_dim = attn_dim // n_heads
+        self.attn_dim = attn_dim
+        self.scale    = math.sqrt(self.head_dim)
+
+        self.W_q = nn.Linear(state_size, attn_dim)
+        self.W_k = nn.Linear(state_size + action_size, attn_dim)
+        self.W_v = nn.Linear(state_size + action_size, attn_dim)
+        self.W_o = nn.Linear(attn_dim, attn_dim)
+
+    def forward(self, states, actions):
+        B, N, _ = states.shape
+        sa = torch.cat([states, actions], dim=-1)
+
+        Q = self.W_q(states)   # (B, N, D)
+        K = self.W_k(sa)
+        V = self.W_v(sa)
+
+        def split_heads(t):
+            return t.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+
+        Q, K, V = split_heads(Q), split_heads(K), split_heads(V)
+        scores  = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # (B, H, N, N)
+        weights = torch.softmax(scores, dim=-1)
+        context = torch.matmul(weights, V)                            # (B, H, N, head_dim)
+        context = context.transpose(1, 2).contiguous().view(B, N, self.attn_dim)
+        context = self.W_o(context)
+
+        return context, weights.mean(dim=1)   # (B, N, D), (B, N, N)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  NOVEL: Twin-Head Attention Critic  (Attention-MATD3 Critic)
+# ═══════════════════════════════════════════════════════════════
+class TwinAttentionCritic(nn.Module):
+    """
+    Centralised critic with:
+      - One shared action-conditioned multi-head attention trunk
+      - TWO independent MLP heads (Q1, Q2) for MATD3 twin-critic trick
+        TD target = min(Q1_target, Q2_target)  to suppress overestimation
+
+    forward() returns (q1, q2).
+    Q1()     returns q1 only (used for actor loss).
     """
 
     def __init__(self, state_size, action_size, seed,
-                 h_1_size=256, h_2_size=128, attn_dim=64):
-        super(CriticQNetwork, self).__init__()
-        self.seed = torch.manual_seed(seed)
+                 h1=256, h2=128, attn_dim=64, n_heads=4, n_agents=2):
+        super().__init__()
+        torch.manual_seed(seed)
 
-        self.state_size = state_size
+        self.state_size  = state_size
         self.action_size = action_size
+        self.n_agents    = n_agents
 
-        self.num_agents = 2
-        self.single_state = state_size // 2   # 33
+        self.attention = ActionConditionedMHA(
+            state_size, action_size, attn_dim=attn_dim, n_heads=n_heads
+        )
 
-        # -------- ATTENTION LAYERS -------- #
-        self.W_q = nn.Linear(self.single_state, attn_dim)
-        self.W_k = nn.Linear(self.single_state, attn_dim)
-        self.W_v = nn.Linear(self.single_state, attn_dim)
+        mlp_in = attn_dim * n_agents + action_size * n_agents
 
-        # -------- POST-ATTENTION MLP -------- #
-        self.fc_1 = nn.Linear(attn_dim * 2 + action_size, h_1_size)
-        self.fc_2 = nn.Linear(h_1_size, h_2_size)
-        self.fc_3 = nn.Linear(h_2_size, h_2_size)
-        self.output = nn.Linear(h_2_size, 1)
+        self.q1_fc1 = nn.Linear(mlp_in, h1)
+        self.q1_fc2 = nn.Linear(h1, h2)
+        self.q1_out = nn.Linear(h2, 1)
 
-        self.reset_parameters()
+        self.q2_fc1 = nn.Linear(mlp_in, h1)
+        self.q2_fc2 = nn.Linear(h1, h2)
+        self.q2_out = nn.Linear(h2, 1)
 
-    def forward(self, state, action):
-        # -------- SPLIT STATES -------- #
-        s1 = state[:, :self.single_state]     # (batch, 33)
-        s2 = state[:, self.single_state:]     # (batch, 33)
+        self.bn_fused       = nn.BatchNorm1d(mlp_in)
+        self.last_attn_map  = None
+        self._reset()
 
-        # -------- Q, K, V -------- #
-        Q1 = self.W_q(s1)
-        K1 = self.W_k(s1)
-        V1 = self.W_v(s1)
+    def _mlp_head(self, x, fc1, fc2, out):
+        return out(F.relu(fc2(F.relu(fc1(x)))))
 
-        Q2 = self.W_q(s2)
-        K2 = self.W_k(s2)
-        V2 = self.W_v(s2)
+    def forward(self, states, actions):
+        B = states.shape[0]
+        s = states.view(B, self.n_agents, self.state_size)
+        a = actions.view(B, self.n_agents, self.action_size)
 
-        # -------- ATTENTION SCORES -------- #
-        scale = torch.sqrt(torch.tensor(Q1.size(-1), dtype=torch.float32)).to(state.device)
+        context, attn_map = self.attention(s, a)
+        self.last_attn_map = attn_map.detach()
 
-        score_12 = torch.sum(Q1 * K2, dim=1, keepdim=True) / scale
-        score_21 = torch.sum(Q2 * K1, dim=1, keepdim=True) / scale
+        fused = torch.cat([context.view(B, -1), a.view(B, -1)], dim=1)
+        if fused.shape[0] > 1:
+            fused = self.bn_fused(fused)
 
-        # -------- SOFTMAX -------- #
-        alpha_12 = torch.softmax(score_12, dim=1)
-        alpha_21 = torch.softmax(score_21, dim=1)
+        q1 = self._mlp_head(fused, self.q1_fc1, self.q1_fc2, self.q1_out)
+        q2 = self._mlp_head(fused, self.q2_fc1, self.q2_fc2, self.q2_out)
+        return q1, q2
 
-        # -------- AGGREGATION -------- #
-        h1 = V1 + alpha_12 * V2
-        h2 = V2 + alpha_21 * V1
+    def Q1(self, states, actions):
+        q1, _ = self.forward(states, actions)
+        return q1
 
-        # -------- CONCAT -------- #
-        h = torch.cat((h1, h2), dim=1)        # (batch, 128)
-        x = torch.cat((h, action), dim=1)     # (batch, 136)
+    def _reset(self):
+        for fc in [self.q1_fc1, self.q1_fc2, self.q2_fc1, self.q2_fc2]:
+            fc.weight.data.uniform_(*hidden_init(fc))
+        for out in [self.q1_out, self.q2_out]:
+            out.weight.data.uniform_(-3e-3, 3e-3)
 
-        # -------- MLP -------- #
-        x = F.relu(self.fc_1(x))
-        x = F.relu(self.fc_2(x))
-        x = F.relu(self.fc_3(x))
 
-        return self.output(x)
-
-    def reset_parameters(self):
-        self.fc_1.weight.data.uniform_(*hidden_init(self.fc_1))
-        self.fc_2.weight.data.uniform_(*hidden_init(self.fc_2))
-        self.fc_3.weight.data.uniform_(*hidden_init(self.fc_3))
-        self.output.weight.data.uniform_(-3e-3, 3e-3)
+# backward-compat alias
+CriticQNetwork = TwinAttentionCritic
