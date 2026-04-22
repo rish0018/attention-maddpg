@@ -22,7 +22,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--env_file', default="../maddpg_env/Reacher.exe")
+    parser.add_argument('--env_file', default="maddpg_env/Reacher.exe")
     parser.add_argument('--mode', choices=["train", "test"], default="train")
     parser.add_argument('--episodes', type=int, default=2000)
     parser.add_argument('--output_weights_prefix', type=str, default="model")
@@ -38,8 +38,12 @@ if __name__ == "__main__":
 
     env_path = args.env_file
     if not os.path.exists(env_path):
+        cwd = os.getcwd()
         print(f"Error: Environment file not found at {env_path}")
+        print(f"Current working directory: {cwd}")
+        print(f"Expected location: {os.path.join(cwd, env_path)}")
         print("Please provide a valid path to the Unity environment executable.")
+        print("Usage: python main.py --env_file <path_to_env>")
         sys.exit(1)
 
     env = UnityEnvironment(
