@@ -415,7 +415,7 @@ Episode  500 | Score: 15.234 | Avg(100): 12.456
 ...
 Episode 1234 | Score: 30.567 | Avg(100): 30.123
 
-✅ Environment solved in 1234 episodes! Avg score: 30.123
+Environment solved in 1234 episodes! Avg score: 30.123
 ```
 
 ### Saved Models
